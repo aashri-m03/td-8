@@ -1,5 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -9,152 +8,187 @@ import base64
 
 app = FastAPI(title="Orders API")
 
-# ==============================
+# ---------------------------
+# Configuration
+# ---------------------------
+
+TOTAL_ORDERS = 54
+RATE_LIMIT = 18
+WINDOW_SECONDS = 10
+
+# ---------------------------
 # CORS
-# ==============================
+# ---------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==============================
-# Assignment Values
-# ==============================
-TOTAL_ORDERS = 54
-RATE_LIMIT = 18
-WINDOW = 10  # seconds
+# ---------------------------
+# In-memory storage
+# ---------------------------
 
-# ==============================
-# In-memory Storage
-# ==============================
-orders_created = {}
-rate_limit_data = {}
+# Idempotency-Key -> order
+idempotency_store = {}
 
-catalog = [
+# ClientID -> timestamps
+rate_limit_store = {}
+
+# Fixed catalog IDs 1..54
+ORDERS_CATALOG = [
     {
         "id": i,
-        "item": f"Order {i}",
-        "price": i * 10
+        "item": f"order-{i}"
     }
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
 
-# ==============================
-# Request Model
-# ==============================
-class OrderRequest(BaseModel):
-    item: str = "Sample Item"
+# ---------------------------
+# Models
+# ---------------------------
+
+class OrderCreate(BaseModel):
+    item: Optional[str] = "sample-order"
 
 
-# ==============================
-# Rate Limiting Middleware
-# ==============================
-@app.middleware("http")
-async def rate_limiter(request: Request, call_next):
+# ---------------------------
+# Helpers
+# ---------------------------
 
-    client_id = request.headers.get("X-Client-Id")
-
-    if client_id:
-
-        now = time.time()
-
-        timestamps = rate_limit_data.setdefault(client_id, [])
-
-        # Remove expired timestamps
-        timestamps[:] = [
-            t for t in timestamps
-            if now - t < WINDOW
-        ]
-
-        if len(timestamps) >= RATE_LIMIT:
-
-            retry_after = WINDOW - (now - timestamps[0])
-
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": "Rate limit exceeded"
-                },
-                headers={
-                    "Retry-After": str(max(1, int(retry_after)))
-                },
-            )
-
-        timestamps.append(now)
-
-    response = await call_next(request)
-    return response
+def encode_cursor(index: int) -> str:
+    return base64.urlsafe_b64encode(
+        str(index).encode()
+    ).decode()
 
 
-# ==============================
-# Root
-# ==============================
+def decode_cursor(cursor: Optional[str]) -> int:
+    if not cursor:
+        return 0
+
+    try:
+        return int(
+            base64.urlsafe_b64decode(
+                cursor.encode()
+            ).decode()
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid cursor"
+        )
+
+
+def enforce_rate_limit(
+    client_id: str,
+):
+    now = time.time()
+
+    timestamps = rate_limit_store.setdefault(
+        client_id,
+        []
+    )
+
+    cutoff = now - WINDOW_SECONDS
+
+    timestamps[:] = [
+        t for t in timestamps
+        if t > cutoff
+    ]
+
+    if len(timestamps) >= RATE_LIMIT:
+        retry_after = max(
+            1,
+            int(timestamps[0] + WINDOW_SECONDS - now + 0.999)
+        )
+
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+            headers={
+                "Retry-After": str(retry_after)
+            }
+        )
+
+    timestamps.append(now)
+
+
+# ---------------------------
+# Health endpoint
+# ---------------------------
+
 @app.get("/")
-def home():
+def health():
     return {
-        "message": "Orders API Running"
+        "status": "ok"
     }
 
 
-# ==============================
-# Idempotent POST /orders
-# ==============================
+# ---------------------------
+# Create order (Idempotent)
+# ---------------------------
+
 @app.post("/orders", status_code=201)
 def create_order(
-    order: OrderRequest,
-    idempotency_key: str = Header(..., alias="Idempotency-Key")
+    payload: OrderCreate,
+    x_client_id: str = Header(
+        default="anonymous",
+        alias="X-Client-Id"
+    ),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key"
+    )
 ):
+    enforce_rate_limit(x_client_id)
 
-    # Return existing order if key already exists
-    if idempotency_key in orders_created:
-        return orders_created[idempotency_key]
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
 
-    new_order = {
+    order = {
         "id": str(uuid.uuid4()),
-        "item": order.item
+        "item": payload.item
     }
 
-    orders_created[idempotency_key] = new_order
+    idempotency_store[idempotency_key] = order
 
-    return new_order
+    return order
 
 
-# ==============================
+# ---------------------------
 # Cursor Pagination
-# ==============================
+# ---------------------------
+
 @app.get("/orders")
-def get_orders(
+def list_orders(
     limit: int = 10,
-    cursor: Optional[str] = None
+    cursor: Optional[str] = None,
+    x_client_id: str = Header(
+        default="anonymous",
+        alias="X-Client-Id"
+    )
 ):
+    enforce_rate_limit(x_client_id)
 
-    start = 0
+    if limit < 1:
+        limit = 1
 
-    if cursor:
-        try:
-            start = int(
-                base64.urlsafe_b64decode(cursor.encode()).decode()
-            )
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid cursor"
-            )
+    start_index = decode_cursor(cursor)
 
-    end = min(start + limit, TOTAL_ORDERS)
+    items = ORDERS_CATALOG[
+        start_index:start_index + limit
+    ]
 
-    items = catalog[start:end]
+    next_index = start_index + len(items)
 
     next_cursor = None
 
-    if end < TOTAL_ORDERS:
-        next_cursor = base64.urlsafe_b64encode(
-            str(end).encode()
-        ).decode()
+    if next_index < TOTAL_ORDERS:
+        next_cursor = encode_cursor(next_index)
 
     return {
         "items": items,
